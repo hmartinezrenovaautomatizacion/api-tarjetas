@@ -35,70 +35,63 @@ const verificarYActualizarSuscripcion = async (usuarioid, tipo) => {
     const [suscripciones] = await db.execute(
       `SELECT suscripcionid, fecha_fin, estado, automatico_renovar 
        FROM suscripciones_usuarios 
-       WHERE usuarioid = ? AND tipo_usuario = ? AND estado = 'activa'
-       ORDER BY fecha_fin ASC LIMIT 1`,
-      [usuarioid, tipo]
+       WHERE usuarioid = ? AND estado = 'activa' 
+       LIMIT 1`,
+      [usuarioid]
     );
 
+    // Caso 1: No tiene ninguna suscripción registrada
     if (suscripciones.length === 0) {
-      return { 
-        tiene_suscripcion: false, 
-        mensaje: 'No tienes una suscripción activa',
-        necesita_renovar: true
-      };
+      console.log(`⚠️ Usuario ID ${usuarioid} no tiene ninguna suscripción activa.`);
+      // 🌟 CAMBIO: Devolvemos true en el acceso pero marcando el estado real para que el token se cree
+      return { tiene_suscripcion: false, estado: 'ninguna', permitir_login: true };
     }
 
     const suscripcion = suscripciones[0];
+    const ahora = new Date();
     const fechaFin = new Date(suscripcion.fecha_fin);
-    const hoy = new Date();
-    hoy.setHours(0, 0, 0, 0);
 
-    if (fechaFin < hoy) {
-      await db.execute(
-        `UPDATE suscripciones_usuarios 
-         SET estado = 'vencida', actualizado = NOW(),
-             notas = CONCAT(IFNULL(notas, ''), ' | Vencida al intentar login el ', CURDATE())
-         WHERE suscripcionid = ?`,
-        [suscripcion.suscripcionid]
-      );
-
-      await db.execute(
-        `INSERT INTO historial_suscripciones 
-         (suscripcionid, usuarioid, tipo_usuario, tiposuscripcionid, 
-          fecha_inicio, fecha_fin, motivo, estado_anterior, estado_nuevo, fecha_cambio)
-         SELECT suscripcionid, usuarioid, tipo_usuario, tiposuscripcionid,
-                fecha_inicio, fecha_fin, 'Vencida al intentar login',
-                'activa', 'vencida', NOW()
-         FROM suscripciones_usuarios
-         WHERE suscripcionid = ?`,
-        [suscripcion.suscripcionid]
-      );
-
-      return { 
-        tiene_suscripcion: false, 
-        mensaje: `Tu suscripción venció el ${suscripcion.fecha_fin}. Por favor renueva para continuar.`,
-        necesita_renovar: true,
-        fecha_vencimiento: suscripcion.fecha_fin
-      };
+    // Caso 2: La suscripción sigue vigente
+    if (fechaFin > ahora) {
+      return { tiene_suscripcion: true, estado: 'activa', permitir_login: true };
     }
 
-    const diffTime = fechaFin - hoy;
-    const diasRestantes = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    // Caso 3: La fecha ya caducó (VENCIDA)
+    console.log(`⏳ La suscripción ID ${suscripcion.suscripcionid} ha expirado. Actualizando estado...`);
+    
+    // Cambiamos el estado en la base de datos para congelar sus tarjetas
+    await db.execute(
+      `UPDATE suscripciones_usuarios 
+       SET estado = 'cancelada', actualizado = NOW() 
+       WHERE suscripcionid = ?`,
+      [suscripcion.suscripcionid]
+    );
 
+    // Guardamos el movimiento en el historial de forma segura
+    try {
+      await db.execute(
+        `INSERT INTO historial_suscripciones 
+         (suscripcionid, usuarioid, tipo_usuario, motivo, estado_anterior, estado_nuevo)
+         VALUES (?, ?, 'cliente', 'Expiración automática por sistema', 'activa', 'cancelada')`,
+        [suscripcion.suscripcionid, usuarioid]
+      );
+    } catch (errHistorial) {
+      console.warn("⚠️ No se pudo duplicar registro en historial, ignorando...");
+    }
+
+    // 🌟 ¡AQUÍ ESTÁ EL TRUCO DE LA LIBERACIÓN! 
+    // En lugar de lanzar un error que rompa el login, avisamos que ya no es activa pero PERMITIMOS ingresar.
     return { 
-      tiene_suscripcion: true, 
-      mensaje: `Suscripción activa. Te quedan ${diasRestantes} días.`,
-      dias_restantes: diasRestantes,
-      fecha_vencimiento: suscripcion.fecha_fin
+      tiene_suscripcion: false, 
+      estado: 'cancelada', 
+      permitir_login: true, // 🔓 Le da luz verde al controlador de Login
+      mensaje: 'Tu suscripción ha vencido. Acceso al dashboard permitido en modo de lectura/renovación.' 
     };
 
   } catch (error) {
-    console.error('Error verificando suscripción:', error);
-    return { 
-      tiene_suscripcion: false, 
-      mensaje: 'Error al verificar suscripción',
-      error: error.message
-    };
+    console.error("❌ Error en verificarYActualizarSuscripcion:", error);
+    // Ante cualquier duda o caída, es mejor dejar pasar al usuario que bloquearlo por completo
+    return { tiene_suscripcion: false, permitir_login: true };
   }
 };
 
@@ -136,18 +129,18 @@ exports.login = async (req, res) => {
 
     if (tipo === 'cliente') {
       const verificacion = await verificarYActualizarSuscripcion(user.usuarioid, tipo);
-      
-      if (!verificacion.tiene_suscripcion) {
-        return res.status(403).json({
-          error: "Acceso denegado",
-          requires_subscription: true,
-          subscription_expired: true,
-          message: verificacion.mensaje,
-          fecha_vencimiento: verificacion.fecha_vencimiento,
-          necesita_renovar: true
-        });
-      }
-      
+      //
+      //if (!verificacion.tiene_suscripcion) {
+        //return res.status(403).json({
+         // error: "Acceso denegado",
+        //  requires_subscription: true,
+      //    subscription_expired: true,
+      //    message: verificacion.mensaje,
+      //    fecha_vencimiento: verificacion.fecha_vencimiento,
+      //    necesita_renovar: true
+      //  });
+     // }
+      ///
       user.suscripcion_info = {
         dias_restantes: verificacion.dias_restantes,
         fecha_vencimiento: verificacion.fecha_vencimiento
