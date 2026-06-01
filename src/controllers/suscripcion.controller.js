@@ -1,5 +1,12 @@
 const db = require("../config/db");
 const { getMexicoISO } = require("../utils/date.utils");
+const { MercadoPagoConfig, Preference, Payment } = require('mercadopago');
+
+// Inicializar el cliente con tu credencial del .env
+const client = new MercadoPagoConfig({ 
+  accessToken: process.env.MP_ACCESS_TOKEN || '' 
+});
+
 
 let sendVencimientoEmail, sendNotificacionManualEmail;
 try {
@@ -98,6 +105,16 @@ exports.crearSuscripcion = async (req, res) => {
     const usuarioid = req.user.usuarioid;
     const tipo = req.user.tipo || 'cliente';
     const { tiposuscripcionid, metodo_pago = 'simulado', renovar_automatico = false } = req.body;
+    const [existente] = await db.execute(
+      "SELECT * FROM suscripciones_usuarios WHERE usuarioid = ? AND estado = 'activa'", 
+      [usuarioid]
+    );
+    
+    if (existente.length > 0) {
+      return res.status(400).json({ 
+        error: "Ya tienes una suscripción activa. No puedes duplicarla." 
+      });
+    }
 
     if (!tiposuscripcionid) {
       return res.status(400).json({ error: "Se requiere el tipo de suscripción" });
@@ -178,8 +195,8 @@ exports.cancelarSuscripcion = async (req, res) => {
 
     await db.execute(
       `UPDATE suscripciones_usuarios 
-       SET estado = 'cancelada', automatico_renovar = 0, actualizado = NOW()
-       WHERE suscripcionid = ?`,
+      SET estado = 'cancelada', automatico_renovar = 0, actualizado = NOW()
+      WHERE suscripcionid = ?`,
       [suscripcion.suscripcionid]
     );
 
@@ -639,3 +656,156 @@ exports.verificarYNotificarVencimientos = async (req, res) => {
     return res.status(500).json({ error: "Error al verificar vencimientos" });
   }
 };
+
+exports.crearPreferenciaPago = async (req, res) => {
+  try {
+    const planOriginal = req.body.tiposuscripcionid; // Recibe "premium" o "business"
+    const periodo = req.body.periodo || 'monthly';   // Recibe "monthly" o "annual"
+    const usuarioid = req.user?.usuarioid || req.user?.id || 0;
+    
+    let tiposuscripcionidReal = 0;
+    let precioFinal = 0;
+    let nombreExhibicion = "";
+    let diasDuracion = 30; // Por defecto 30 días para mensual
+
+    console.log(`📥 Procesando catálogo base -> Plan: "${planOriginal}" | Periodo: "${periodo}"`);
+
+    // 1. Normalizamos los textos del Frontend
+    const planNormalizado = typeof planOriginal === 'string' ? planOriginal.toLowerCase().trim() : '';
+    const periodoNormalizado = periodo.toLowerCase().trim();
+
+    // 2. Determinamos el ID base (Solo tus 2 suscripciones) y calculamos el precio dinámicamente
+    if (planNormalizado === 'premium' || planNormalizado === 'mensual') {
+      tiposuscripcionidReal = 1; // ID fijo en tu BD para Premium
+      
+      if (periodoNormalizado === 'annual' || periodoNormalizado === 'anual') {
+        precioFinal = 400.00; // 💰 Precio de Premium Anual (Ejemplo)
+        nombreExhibicion = "Plan Premium Anual";
+        diasDuracion = 365;
+      } else {
+        precioFinal = 40.00;  // 💰 Precio de Premium Mensual
+        nombreExhibicion = "Plan Premium Mensual";
+        diasDuracion = 30;
+      }
+    } 
+    else if (planNormalizado === 'business' || planNormalizado === 'smb') {
+      tiposuscripcionidReal = 2; // ID fijo en tu BD para Business
+      
+      if (periodoNormalizado === 'annual' || periodoNormalizado === 'anual') {
+        precioFinal = 1500.00; // 💰 Precio de Business Anual (Ejemplo)
+        nombreExhibicion = "Plan Business Anual";
+        diasDuracion = 365;
+      } else {
+        precioFinal = 150.00;  // 💰 Precio de Business Mensual (Ejemplo)
+        nombreExhibicion = "Plan Business Mensual";
+        diasDuracion = 30;
+      }
+    } else {
+      // Si el frontend envió directamente el número del ID en vez del string
+      tiposuscripcionidReal = parseInt(planOriginal, 10);
+      // Aquí podrías buscar en la BD el precio base si fuera necesario
+    }
+
+    // Validación de seguridad por si no cayó en ningún plan conocido
+    if (!tiposuscripcionidReal || precioFinal === 0) {
+      return res.status(400).json({ error: "El plan o periodo solicitado no es válido." });
+    }
+
+    // 3. Verificamos que el tipo base exista en la base de datos (para traer configuración de límites si tienes)
+    const [tipos] = await db.execute(
+      "SELECT * FROM tipos_suscripcion WHERE tiposuscripcionid = ? AND activo = 1",
+      [tiposuscripcionidReal]
+    );
+
+    if (tipos.length === 0) {
+      return res.status(404).json({ error: "El plan base no se encuentra activo." });
+    }
+
+    console.log(`✅ Todo listo. Cobrando: $${precioFinal} MXN por ${nombreExhibicion}`);
+
+    // 4. Crear la preferencia en Mercado Pago inyectando las variables dinámicas
+    const preference = new Preference(client);
+    const preferenceData = {
+      items: [
+        {
+          id: tiposuscripcionidReal.toString(),
+          title: `Suscripción Renova: ${nombreExhibicion}`, // Le dice al usuario exactamente qué ciclo compra
+          quantity: 1,
+          unit_price: precioFinal, // 🌟 El precio calculado (Anual o Mensual)
+          currency_id: 'MXN'
+        }
+      ],
+      metadata: {
+        usuario_id: usuarioid,
+        tipo_suscripcion_id: tiposuscripcionidReal,
+        periodo: periodoNormalizado, // 🌟 GUARDAMOS EL PERIODO EN METADATOS para leerlo en el Webhook / Success
+        dias_duracion: diasDuracion  // Le servirá a tu función de activación para calcular la 'fecha_fin'
+      },
+      backUrls: { 
+        success: "http://localhost:5173/dashboard?payment=success",
+        failure: "http://localhost:5173/precios?payment=error",
+        pending: "http://localhost:5173/dashboard"
+      },
+
+      // ✅ SOLUCIÓN: También en camelCase y apuntando a "approved"
+      autoReturn: "approved"
+    };
+
+    const result = await preference.create({ body: preferenceData });
+    return res.json({ id: result.id });
+
+  } catch (error) {
+    console.error("❌ ERROR CRÍTICO EN MERCADO PAGO:", error);
+    return res.status(500).json({ error: "Error interno al procesar el pago" });
+  }
+};
+
+  exports.recibirNotificacionPago = async (req, res) => {
+      try {
+          // 1. Mercado Pago envía el tipo de notificación en los query params o body
+          const { query } = req;
+          const topic = query.topic || req.body.type;
+
+          // Nos interesa únicamente cuando nos notifican un "payment" (pago)
+          if (topic === "payment") {
+              const paymentId = query.id || req.body.data.id;
+              
+              console.log(`📥 Webhook recibido: Consultando pago ID ${paymentId}`);
+
+              // 2. Consultar a Mercado Pago de forma segura para verificar que el pago es real
+              const payment = new Payment(mercadopagoClient); // Usa tu cliente configurado
+              const paymentData = await payment.get({ id: paymentId });
+
+              // 3. Si el pago fue aprobado exitosamente
+              if (paymentData.status === "approved") {
+                  
+                  // Extraemos los datos que guardamos previamente en la metadata al crear la preferencia
+                  const { usuario_id, tipo_suscripcion_id } = paymentData.metadata;
+                  
+                  // Definimos los días según el plan (puedes mapearlo dinámicamente)
+                  const diasSuscripcion = tipo_suscripcion_id === 'premium' ? 30 : 30; 
+
+                  console.log(`🎉 Pago aprobado para el usuario ${usuario_id}. Activando plan ${tipo_suscripcion_id}...`);
+
+                  // 4. Reutilizar la lógica de tu endpoint interno de base de datos
+                  // Aquí ejecutas la misma consulta SQL o función que usa tu endpoint '/api/admin/suscripciones/crear'
+                  await db.query(
+                      `INSERT INTO suscripciones (usuario_id, tiposuscripcionid, dias, renovar_automatico, fecha_inicio, estado) 
+                      VALUES (?, ?, ?, ?, NOW(), 'activo')`,
+                      [usuario_id, tipo_suscripcion_id, diasSuscripcion, true]
+                  );
+
+                  // También actualizas el rol o permisos en la tabla de usuarios si es necesario
+                  await db.query('UPDATE usuarios SET rol = "premium" WHERE id = ?', [usuario_id]);
+              }
+          }
+
+          // Siempre responder un 200 o 200 OK a Mercado Pago para que sepa que recibiste la notificación
+          return res.sendStatus(200);
+
+      } catch (error) {
+          console.error("❌ Error procesando el Webhook de Mercado Pago:", error);
+          // Respondemos 500 para que Mercado Pago intente reenviar la notificación más tarde
+          return res.status(500).json({ error: error.message });
+      }
+  };
