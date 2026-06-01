@@ -742,9 +742,9 @@ exports.crearPreferenciaPago = async (req, res) => {
         dias_duracion: diasDuracion  // Le servirá a tu función de activación para calcular la 'fecha_fin'
       },
       backUrls: { 
-        success: "http://localhost:5173/dashboard?payment=success",
-        failure: "http://localhost:5173/precios?payment=error",
-        pending: "http://localhost:5173/dashboard"
+        success: "https://tapcards.renova-automatizacion.com?payment=success",
+        failure: "https://tapcards.renova-automatizacion.com/precios?payment=error",
+        pending: "https://tapcards.renova-automatizacion.com"
       },
 
       // ✅ SOLUCIÓN: También en camelCase y apuntando a "approved"
