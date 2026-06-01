@@ -742,7 +742,7 @@ exports.crearPreferenciaPago = async (req, res) => {
         dias_duracion: diasDuracion  // Le servirá a tu función de activación para calcular la 'fecha_fin'
       },
       backUrls: { 
-        success: "https://tapcards.renova-automatizacion.com?payment=success",
+        success: "https://tapcards.renova-automatizacion.com/dashboard?payment=success",
         failure: "https://tapcards.renova-automatizacion.com/precios?payment=error",
         pending: "https://tapcards.renova-automatizacion.com"
       },
