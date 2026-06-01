@@ -741,14 +741,14 @@ exports.crearPreferenciaPago = async (req, res) => {
         periodo: periodoNormalizado, // 🌟 GUARDAMOS EL PERIODO EN METADATOS para leerlo en el Webhook / Success
         dias_duracion: diasDuracion  // Le servirá a tu función de activación para calcular la 'fecha_fin'
       },
-      backUrls: { 
-        success: "http://localhost:5173/dashboard?payment=success",
-        failure: "http://localhost:5173/precios?payment=error",
-        pending: "http://localhost:5173/dashboard"
+      back_urls: { 
+        success: "https://tapcards.renova-automatizacion.com/dashboard?payment=success",
+        failure: "https://tapcards.renova-automatizacion.com/precios?payment=error",
+        pending: "https://tapcards.renova-automatizacion.com"
       },
 
       // ✅ SOLUCIÓN: También en camelCase y apuntando a "approved"
-      autoReturn: "approved"
+      auto_return: "approved"
     };
 
     const result = await preference.create({ body: preferenceData });
@@ -760,52 +760,77 @@ exports.crearPreferenciaPago = async (req, res) => {
   }
 };
 
-  exports.recibirNotificacionPago = async (req, res) => {
-      try {
-          // 1. Mercado Pago envía el tipo de notificación en los query params o body
-          const { query } = req;
-          const topic = query.topic || req.body.type;
+exports.recibirNotificacionPago = async (req, res) => {
+    try {
+        // 1. Mercado Pago envía el tipo de notificación en query params o en el body
+        const { query, body } = req;
+        const topic = query.topic || body.type;
 
-          // Nos interesa únicamente cuando nos notifican un "payment" (pago)
-          if (topic === "payment") {
-              const paymentId = query.id || req.body.data.id;
-              
-              console.log(`📥 Webhook recibido: Consultando pago ID ${paymentId}`);
+        // Nos interesa únicamente cuando nos notifican un "payment" (pago)
+        if (topic === "payment") {
+            const paymentId = query.id || (body.data && body.data.id);
+            
+            if (!paymentId) {
+                console.log("⚠️ Webhook recibido pero no se encontró un ID de pago válido.");
+                return res.sendStatus(200);
+            }
 
-              // 2. Consultar a Mercado Pago de forma segura para verificar que el pago es real
-              const payment = new Payment(mercadopagoClient); // Usa tu cliente configurado
-              const paymentData = await payment.get({ id: paymentId });
+            console.log(`📥 Webhook recibido: Consultando pago ID ${paymentId}`);
 
-              // 3. Si el pago fue aprobado exitosamente
-              if (paymentData.status === "approved") {
-                  
-                  // Extraemos los datos que guardamos previamente en la metadata al crear la preferencia
-                  const { usuario_id, tipo_suscripcion_id } = paymentData.metadata;
-                  
-                  // Definimos los días según el plan (puedes mapearlo dinámicamente)
-                  const diasSuscripcion = tipo_suscripcion_id === 'premium' ? 30 : 30; 
+            // 2. Consultar a Mercado Pago de forma segura usando tu Token de Acceso
+            const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
+            const payment = new Payment(client);
+            const paymentData = await payment.get({ id: paymentId });
 
-                  console.log(`🎉 Pago aprobado para el usuario ${usuario_id}. Activando plan ${tipo_suscripcion_id}...`);
+            // 3. Si el pago fue aprobado exitosamente por la plataforma
+            if (paymentData.status === "approved") {
+                
+                // Extraemos los metadatos que previamente guardaste al crear la preferencia en el backend
+                const { usuario_id, tipo_suscripcion_id } = paymentData.metadata;
+                
+                if (!usuario_id || !tipo_suscripcion_id) {
+                    console.error("❌ Error: El pago no contiene metadatos (usuario_id o tipo_suscripcion_id).");
+                    return res.sendStatus(200);
+                }
 
-                  // 4. Reutilizar la lógica de tu endpoint interno de base de datos
-                  // Aquí ejecutas la misma consulta SQL o función que usa tu endpoint '/api/admin/suscripciones/crear'
-                  await db.query(
-                      `INSERT INTO suscripciones (usuario_id, tiposuscripcionid, dias, renovar_automatico, fecha_inicio, estado) 
-                      VALUES (?, ?, ?, ?, NOW(), 'activo')`,
-                      [usuario_id, tipo_suscripcion_id, diasSuscripcion, true]
-                  );
+                // Definimos los días según el plan (Premium o Negocios)
+                const diasSuscripcion = tipo_suscripcion_id === 'business' ? 30 : 30; 
 
-                  // También actualizas el rol o permisos en la tabla de usuarios si es necesario
-                  await db.query('UPDATE usuarios SET rol = "premium" WHERE id = ?', [usuario_id]);
-              }
-          }
+                console.log(`🎉 Pago aprobado para el usuario ${usuario_id}. Activando plan: ${tipo_suscripcion_id}...`);
 
-          // Siempre responder un 200 o 200 OK a Mercado Pago para que sepa que recibiste la notificación
-          return res.sendStatus(200);
+                // CALCULAR FECHAS: Mapeo exacto para tus columnas de base de datos
+                const fechaInicio = new Date();
+                const fechaFin = new Date();
+                fechaFin.setDate(fechaFin.getDate() + diasSuscripcion);
 
-      } catch (error) {
-          console.error("❌ Error procesando el Webhook de Mercado Pago:", error);
-          // Respondemos 500 para que Mercado Pago intente reenviar la notificación más tarde
-          return res.status(500).json({ error: error.message });
-      }
-  };
+                // 4. Guardar o actualizar en la tabla correcta: 'suscripciones_usuarios'
+                // Usamos ON DUPLICATE KEY UPDATE por si el usuario ya tenía un registro previo, se actualice en lugar de fallar
+                const sqlSuscripcion = `
+                    INSERT INTO suscripciones_usuarios (usuarioid, tiposuscripcionid, fecha_inicio, fecha_fin, estado) 
+                    VALUES (?, ?, ?, ?, 'activa')
+                    ON DUPLICATE KEY UPDATE 
+                        tiposuscripcionid = ?, fecha_inicio = ?, fecha_fin = ?, estado = 'activa'
+                `;
+
+                await db.query(sqlSuscripcion, [
+                    usuario_id, tipo_suscripcion_id, fechaInicio, fechaFin, // Valores para el INSERT
+                    tipo_suscripcion_id, fechaInicio, fechaFin             // Valores para el UPDATE
+                ]);
+
+                // 5. Opcional: Actualizar el rol en tu tabla de usuarios si tu lógica lo maneja
+                // Ajusta 'usuarios' e 'id' según cómo se llamen en tu BD real
+                await db.query('UPDATE usuarios SET rol = "premium" WHERE id = ?', [usuario_id]);
+                
+                console.log(`💪 Base de datos actualizada con éxito para el usuario ${usuario_id}.`);
+            }
+        }
+
+        // 👍 SIEMPRE responder un 200 OK rápido a Mercado Pago para frenar los reintentos
+        return res.sendStatus(200);
+
+    } catch (error) {
+        console.error("❌ Error crítico procesando el Webhook de Mercado Pago:", error);
+        // Devolvemos 200 para que Mercado Pago no genere un bucle infinito de reintentos en tu consola si el error es de código local
+        return res.status(200).send("Error manejado internamente");
+    }
+};
