@@ -8,7 +8,7 @@ const { requireTwoFactor } = require("../middleware/twoFactor.middleware");
 // Rutas públicas (para obtener planes)
 router.get("/suscripciones/tipos", suscripcionController.getTiposSuscripcion);
 router.post("/suscripciones/webhooks", suscripcionController.recibirNotificacionPago);
-router.post('/suscripciones/verificar-regreso', verificarToken, suscripcionController.verificarRegresoPago);
+router.post('/suscripciones/verificar-regreso', authenticateToken, suscripcionController.verificarRegresoPago);
 
 // Rutas protegidas para clientes
 router.get("/cliente/suscripcion/mi-suscripcion", authenticateToken, authorizeCliente, requireTwoFactor, suscripcionController.getMiSuscripcion);
