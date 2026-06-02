@@ -104,7 +104,7 @@ exports.crearSuscripcion = async (req, res) => {
   try {
     const usuarioid = req.user.usuarioid;
     const tipo = req.user.tipo || 'cliente';
-    const { tiposuscripcionid, metodo_pago = 'simulado', renovar_automatico = false } = req.body;
+    const { tiposuscripcionid, metodo_pago = 'simulado', renovar_automatico = false, duracion_dias} = req.body;
     const [existente] = await db.execute(
       "SELECT * FROM suscripciones_usuarios WHERE usuarioid = ? AND estado = 'activa'", 
       [usuarioid]
@@ -130,9 +130,10 @@ exports.crearSuscripcion = async (req, res) => {
     }
 
     const plan = tipos[0];
+    const diasFinales = duracion_dias ? parseInt(duracion_dias, 10) : plan.duracion_dias;
     const fecha_inicio = getMexicoISO().split('T')[0];
     const fecha_fin = new Date();
-    fecha_fin.setDate(fecha_fin.getDate() + plan.duracion_dias);
+    fecha_fin.setDate(fecha_fin.getDate() + diasFinales);
     const fecha_fin_str = fecha_fin.toISOString().split('T')[0];
 
     await db.execute(
