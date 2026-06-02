@@ -834,3 +834,95 @@ exports.recibirNotificacionPago = async (req, res) => {
         return res.status(200).send("Error manejado internamente");
     }
 };
+
+exports.verificarRegresoPago = async (req, res) => {
+  try {
+    const usuarioid = req.user.usuarioid; // Tu middleware de token ya te da el id
+    const tipo = req.user.tipo || 'cliente';
+    const { payment_id } = req.body;
+
+    if (!payment_id) {
+      return res.status(400).json({ error: "Falta el id de pago" });
+    }
+
+    console.log(`🔍 Verificando regreso de pago para el ID: ${payment_id}`);
+
+    // 1. Consultamos a Mercado Pago qué plan se compró (leyendo los metadata)
+    const client = new MercadoPagoConfig({ accessToken: process.env.MP_ACCESS_TOKEN });
+    const payment = new Payment(client);
+    const paymentData = await payment.get({ id: paymentId });
+
+    if (paymentData.status !== "approved") {
+      return res.status(400).json({ error: "El pago no está aprobado en Mercado Pago" });
+    }
+
+    // Extraemos lo que guardamos al crear la preferencia
+    const { tipo_suscripcion_id } = paymentData.metadata;
+
+    // 2. Buscamos el plan en tu base de datos para saber los días de duración
+    const [tipos] = await db.execute(
+      "SELECT * FROM tipos_suscripcion WHERE tiposuscripcionid = ? AND activo = 1",
+      [tipo_suscripcion_id]
+    );
+
+    if (tipos.length === 0) {
+      return res.status(404).json({ error: "El tipo de suscripción comprado no existe en la BD" });
+    }
+
+    const plan = tipos[0];
+
+    // 3. Verificamos si el Webhook ya la insertó (para no duplicar)
+    const [existente] = await db.execute(
+      "SELECT * FROM suscripciones_usuarios WHERE usuarioid = ? AND tiposuscripcionid = ? AND estado = 'activa'", 
+      [usuarioid, tipo_suscripcion_id]
+    );
+    
+    if (existente.length > 0) {
+      return res.status(200).json({ message: "La suscripción ya había sido activada por el webhook" });
+    }
+
+    // 4. Tu excelente lógica de cálculo de fechas
+    const fecha_inicio = getMexicoISO().split('T')[0];
+    const fecha_fin = new Date();
+    fecha_fin.setDate(fecha_fin.getDate() + plan.duracion_dias);
+    const fecha_fin_str = fecha_fin.toISOString().split('T')[0];
+
+    // Cancelar suscripciones activas anteriores del mismo usuario
+    await db.execute(
+      `UPDATE suscripciones_usuarios 
+       SET estado = 'cancelada', actualizado = NOW()
+       WHERE usuarioid = ? AND tipo_usuario = ? AND estado = 'activa'`,
+      [usuarioid, tipo]
+    );
+
+    // 5. Insertar la nueva suscripción activa usando los datos reales de Mercado Pago
+    const [result] = await db.execute(
+      `INSERT INTO suscripciones_usuarios 
+       (usuarioid, tipo_usuario, tiposuscripcionid, fecha_inicio, fecha_fin, 
+        fecha_ultima_renovacion, estado, automatico_renovar, ultimo_pago_id, notas)
+       VALUES (?, ?, ?, ?, ?, NOW(), 'activa', ?, ?, ?)`,
+      [usuarioid, tipo, tipo_suscripcion_id, fecha_inicio, fecha_fin_str, 
+       1, payment_id, `Suscripción ${plan.nombre} - Mercado Pago Webflow`]
+    );
+
+    // 6. Registrar en el historial
+    await db.execute(
+      `INSERT INTO historial_suscripciones 
+       (suscripcionid, usuarioid, tipo_usuario, tiposuscripcionid, 
+        fecha_inicio, fecha_fin, motivo, estado_anterior, estado_nuevo)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [result.insertId, usuarioid, tipo, tipo_suscripcion_id, 
+       fecha_inicio, fecha_fin_str, 'Nueva suscripción por pasarela', 'none', 'activa']
+    );
+
+    return res.status(201).json({
+      message: "Suscripción creada exitosamente al regresar",
+      suscripcionid: result.insertId,
+      plan: plan.nombre
+    });
+
+  } catch (error) {
+    console.error("❌ Error en verificarRegresoPago:", error);
+    return res.status(500).json({ error: "Error al validar el retorno del pago" });
+  }
+};
